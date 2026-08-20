@@ -1,175 +1,372 @@
 import os
+import time
+from pathlib import Path
 
 import mysql.connector
 import pandas as pd
 from dotenv import load_dotenv
 
-from src.etl.ingest import load_raw_data
-from src.etl.transform import transform_data
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+BASE_DIR = Path(__file__).resolve().parents[2]
+CSV_FILE = BASE_DIR / "data" / "raw" / "Superstore.csv"
+
+load_dotenv(BASE_DIR / ".env")
 
 
-load_dotenv()
-
+# ============================================================
+# DATABASE CONNECTION
+# ============================================================
 
 def get_connection():
-    """Create a connection to the cloud_analytics database."""
-    return mysql.connector.connect(
-        host=os.getenv("MYSQL_HOST"),
-        user=os.getenv("MYSQL_USER"),
-        password=os.getenv("MYSQL_PASSWORD"),
-        database=os.getenv("MYSQL_DATABASE"),
+    for attempt in range(1, 11):
+        try:
+            connection = mysql.connector.connect(
+                host=os.getenv("MYSQL_HOST", "localhost"),
+                port=int(os.getenv("MYSQL_PORT", "3306")),
+                user=os.getenv("MYSQL_USER"),
+                password=os.getenv("MYSQL_PASSWORD"),
+                database=os.getenv("MYSQL_DATABASE", "cloud_analytics"),
+            )
+
+            print("Database connection successful.")
+            return connection
+
+        except mysql.connector.Error as error:
+            print(
+                f"MySQL connection attempt {attempt}/10 failed: {error}"
+            )
+
+            if attempt < 10:
+                time.sleep(2)
+
+    raise RuntimeError(
+        "Could not connect to MySQL after 10 attempts."
     )
 
 
-def load_customers(connection, df):
-    """Load customers into dim_customer."""
+# ============================================================
+# LOAD AND CLEAN CSV
+# ============================================================
 
-    customers = df[
-        ["customer_id", "customer_name", "segment"]
-    ].drop_duplicates()
+def load_raw_data():
+    if not CSV_FILE.exists():
+        raise FileNotFoundError(
+            f"CSV file not found: {CSV_FILE}"
+        )
+
+    print(f"Reading CSV: {CSV_FILE}")
+
+    df = pd.read_csv(
+        CSV_FILE,
+        encoding="latin1"
+    )
+
+    # Standardize column names
+    df.columns = (
+        df.columns
+        .str.strip()
+        .str.lower()
+        .str.replace(" ", "_")
+        .str.replace("-", "_")
+    )
+
+    print(f"Rows loaded: {len(df)}")
+
+    # Convert dates
+    df["order_date"] = pd.to_datetime(
+        df["order_date"],
+        errors="coerce"
+    )
+
+    df["ship_date"] = pd.to_datetime(
+        df["ship_date"],
+        errors="coerce"
+    )
+
+    # Convert numeric columns
+    df["postal_code"] = pd.to_numeric(
+        df["postal_code"],
+        errors="coerce"
+    ).fillna(0).astype(int)
+
+    df["quantity"] = pd.to_numeric(
+        df["quantity"],
+        errors="coerce"
+    ).fillna(0).astype(int)
+
+    df["sales"] = pd.to_numeric(
+        df["sales"],
+        errors="coerce"
+    ).fillna(0)
+
+    df["discount"] = pd.to_numeric(
+        df["discount"],
+        errors="coerce"
+    ).fillna(0)
+
+    df["profit"] = pd.to_numeric(
+        df["profit"],
+        errors="coerce"
+    ).fillna(0)
+
+    # Remove invalid dates
+    df = df.dropna(
+        subset=["order_date", "ship_date"]
+    ).copy()
+
+    print(f"Clean rows: {len(df)}")
+
+    return df
+
+
+# ============================================================
+# CUSTOMERS
+# ============================================================
+
+def load_customers(connection, df):
+
+    cursor = connection.cursor()
 
     query = """
         INSERT INTO dim_customer
-            (customer_id, customer_name, segment)
-        VALUES
-            (%s, %s, %s)
+        (
+            customer_id,
+            customer_name,
+            segment
+        )
+        VALUES (%s, %s, %s)
         ON DUPLICATE KEY UPDATE
             customer_name = VALUES(customer_name),
             segment = VALUES(segment)
     """
 
-    cursor = connection.cursor()
-
-    records = list(
-        customers.itertuples(index=False, name=None)
+    data = (
+        df[
+            [
+                "customer_id",
+                "customer_name",
+                "segment"
+            ]
+        ]
+        .drop_duplicates(
+            subset=["customer_id"]
+        )
+        .itertuples(
+            index=False,
+            name=None
+        )
     )
 
-    cursor.executemany(query, records)
+    cursor.executemany(
+        query,
+        list(data)
+    )
+
     connection.commit()
     cursor.close()
 
-    print(f"Customers loaded: {len(records):,}")
+    print(
+        f"Customers loaded: {df['customer_id'].nunique()}"
+    )
 
+
+# ============================================================
+# PRODUCTS
+# ============================================================
 
 def load_products(connection, df):
-    """Load products into dim_product."""
 
-    products = df[
-        [
-            "product_id",
-            "product_name",
-            "category",
-            "sub_category",
-        ]
-    ].drop_duplicates()
+    cursor = connection.cursor()
 
     query = """
         INSERT INTO dim_product
-            (product_id, product_name, category, sub_category)
-        VALUES
-            (%s, %s, %s, %s)
+        (
+            product_id,
+            product_name,
+            category,
+            sub_category
+        )
+        VALUES (%s, %s, %s, %s)
         ON DUPLICATE KEY UPDATE
             category = VALUES(category),
             sub_category = VALUES(sub_category)
     """
 
-    cursor = connection.cursor()
-
-    records = list(
-        products.itertuples(index=False, name=None)
+    data = (
+        df[
+            [
+                "product_id",
+                "product_name",
+                "category",
+                "sub_category"
+            ]
+        ]
+        .drop_duplicates(
+            subset=[
+                "product_id",
+                "product_name"
+            ]
+        )
+        .itertuples(
+            index=False,
+            name=None
+        )
     )
 
-    cursor.executemany(query, records)
+    records = list(data)
+
+    cursor.executemany(
+        query,
+        records
+    )
+
     connection.commit()
     cursor.close()
 
-    print(f"Products loaded: {len(records):,}")
+    print(
+        f"Products loaded: {len(records)}"
+    )
 
+
+# ============================================================
+# LOCATIONS
+# ============================================================
 
 def load_locations(connection, df):
-    """Load locations into dim_location."""
 
-    locations = df[
-        [
-            "country",
-            "state",
-            "city",
-            "postal_code",
-            "region",
-        ]
-    ].drop_duplicates()
+    cursor = connection.cursor()
 
     query = """
         INSERT INTO dim_location
-            (country, state, city, postal_code, region)
-        VALUES
-            (%s, %s, %s, %s, %s)
+        (
+            country,
+            state,
+            city,
+            postal_code,
+            region
+        )
+        VALUES (%s, %s, %s, %s, %s)
         ON DUPLICATE KEY UPDATE
             region = VALUES(region)
     """
 
-    cursor = connection.cursor()
-
-    records = list(
-        locations.itertuples(index=False, name=None)
+    data = (
+        df[
+            [
+                "country",
+                "state",
+                "city",
+                "postal_code",
+                "region"
+            ]
+        ]
+        .drop_duplicates(
+            subset=[
+                "country",
+                "state",
+                "city",
+                "postal_code"
+            ]
+        )
+        .itertuples(
+            index=False,
+            name=None
+        )
     )
 
-    cursor.executemany(query, records)
+    records = list(data)
+
+    cursor.executemany(
+        query,
+        records
+    )
+
     connection.commit()
     cursor.close()
 
-    print(f"Locations loaded: {len(records):,}")
+    print(
+        f"Locations loaded: {len(records)}"
+    )
 
+
+# ============================================================
+# DATES
+# ============================================================
 
 def load_dates(connection, df):
-    """Load calendar dates into dim_date."""
 
-    start_date = min(
-        df["order_date"].min(),
-        df["ship_date"].min(),
+    cursor = connection.cursor()
+
+    dates = (
+        df[["order_date"]]
+        .drop_duplicates()
+        .copy()
     )
 
-    end_date = max(
-        df["order_date"].max(),
-        df["ship_date"].max(),
+    dates["date_key"] = (
+        dates["order_date"]
+        .dt.strftime("%Y%m%d")
+        .astype(int)
     )
 
-    dates = pd.date_range(
-        start=start_date,
-        end=end_date,
-        freq="D",
+    dates["year"] = (
+        dates["order_date"]
+        .dt.year
+        .astype(int)
     )
 
-    records = []
+    dates["quarter"] = (
+        "Q"
+        + dates["order_date"]
+        .dt.quarter
+        .astype(str)
+    )
 
-    for date in dates:
-        records.append(
-            (
-                int(date.strftime("%Y%m%d")),
-                date.date(),
-                date.year,
-                (date.month - 1) // 3 + 1,
-                date.month,
-                date.strftime("%B"),
-                int(date.isocalendar().week),
-                date.day,
-            )
-        )
+    dates["month"] = (
+        dates["order_date"]
+        .dt.month
+        .astype(int)
+    )
+
+    dates["month_name"] = (
+        dates["order_date"]
+        .dt.strftime("%B")
+    )
+
+    dates["week"] = (
+        dates["order_date"]
+        .dt.isocalendar()
+        .week
+        .astype(int)
+    )
+
+    dates["day"] = (
+        dates["order_date"]
+        .dt.day
+        .astype(int)
+    )
 
     query = """
         INSERT INTO dim_date
-            (
-                date_key,
-                full_date,
-                year,
-                quarter,
-                month,
-                month_name,
-                week,
-                day
-            )
+        (
+            date_key,
+            full_date,
+            year,
+            quarter,
+            month,
+            month_name,
+            week,
+            day
+        )
         VALUES
-            (%s, %s, %s, %s, %s, %s, %s, %s)
+        (
+            %s, %s, %s, %s,
+            %s, %s, %s, %s
+        )
         ON DUPLICATE KEY UPDATE
             year = VALUES(year),
             quarter = VALUES(quarter),
@@ -179,83 +376,173 @@ def load_dates(connection, df):
             day = VALUES(day)
     """
 
-    cursor = connection.cursor()
+    records = (
+        dates[
+            [
+                "date_key",
+                "order_date",
+                "year",
+                "quarter",
+                "month",
+                "month_name",
+                "week",
+                "day"
+            ]
+        ]
+        .itertuples(
+            index=False,
+            name=None
+        )
+    )
 
-    cursor.executemany(query, records)
+    records = list(records)
+
+    cursor.executemany(
+        query,
+        records
+    )
+
     connection.commit()
     cursor.close()
 
-    print(f"Dates loaded: {len(records):,}")
+    print(
+        f"Dates loaded: {len(records)}"
+    )
 
 
-def load_sales(connection, df):
-    """Load sales transactions into fact_sales."""
+# ============================================================
+# DIMENSION LOOKUPS
+# ============================================================
 
-    cursor = connection.cursor(dictionary=True)
+def get_customer_keys(connection):
+
+    cursor = connection.cursor()
 
     cursor.execute(
         """
-        SELECT customer_key, customer_id
+        SELECT customer_id, customer_key
         FROM dim_customer
         """
     )
 
-    customer_map = {
-        row["customer_id"]: row["customer_key"]
-        for row in cursor.fetchall()
-    }
+    result = dict(cursor.fetchall())
+
+    cursor.close()
+
+    return result
+
+
+def get_product_keys(connection):
+
+    cursor = connection.cursor()
 
     cursor.execute(
         """
-        SELECT product_key, product_id, product_name
+        SELECT
+            product_id,
+            product_name,
+            product_key
         FROM dim_product
         """
     )
 
-    product_map = {
-        (row["product_id"], row["product_name"]): row["product_key"]
-        for row in cursor.fetchall()
-    }
-
-    cursor.execute(
-        """
-        SELECT location_key, country, state, city, postal_code
-        FROM dim_location
-        """
-    )
-
-    location_map = {
-        (
-            row["country"],
-            row["state"],
-            row["city"],
-            row["postal_code"],
-        ): row["location_key"]
+    result = {
+        (row[0], row[1]): row[2]
         for row in cursor.fetchall()
     }
 
     cursor.close()
+
+    return result
+
+
+def get_location_keys(connection):
+
+    cursor = connection.cursor()
+
+    cursor.execute(
+        """
+        SELECT
+            country,
+            state,
+            city,
+            postal_code,
+            location_key
+        FROM dim_location
+        """
+    )
+
+    result = {
+        (
+            row[0],
+            row[1],
+            row[2],
+            row[3]
+        ): row[4]
+        for row in cursor.fetchall()
+    }
+
+    cursor.close()
+
+    return result
+
+
+# ============================================================
+# FACT SALES
+# ============================================================
+
+def load_fact_sales(connection, df):
+
+    cursor = connection.cursor()
+
+    customer_keys = get_customer_keys(connection)
+    product_keys = get_product_keys(connection)
+    location_keys = get_location_keys(connection)
+
+    # Clear previous fact data so the ETL can be
+    # safely executed multiple times.
+    cursor.execute(
+        "DELETE FROM fact_sales"
+    )
+
+    connection.commit()
 
     records = []
 
     for row in df.itertuples(index=False):
 
-        date_key = int(row.order_date.strftime("%Y%m%d"))
+        customer_key = customer_keys.get(
+            row.customer_id
+        )
 
-        customer_key = customer_map[row.customer_id]
+        product_key = product_keys.get(
+            (
+                row.product_id,
+                row.product_name
+            )
+        )
 
-        product_key = product_map[
-            (row.product_id, row.product_name)
-        ]
-
-        location_key = location_map[
+        location_key = location_keys.get(
             (
                 row.country,
                 row.state,
                 row.city,
-                row.postal_code,
+                int(row.postal_code)
             )
-        ]
+        )
+
+        if customer_key is None:
+            continue
+
+        if product_key is None:
+            continue
+
+        if location_key is None:
+            continue
+
+        date_key = int(
+            row.order_date.strftime("%Y%m%d")
+        )
 
         records.append(
             (
@@ -269,54 +556,97 @@ def load_sales(connection, df):
                 int(row.quantity),
                 float(row.sales),
                 float(row.discount),
-                float(row.profit),
+                float(row.profit)
             )
         )
 
     query = """
         INSERT INTO fact_sales
-            (
-                order_id,
-                date_key,
-                customer_key,
-                product_key,
-                location_key,
-                ship_date,
-                ship_mode,
-                quantity,
-                sales,
-                discount,
-                profit
-            )
+        (
+            order_id,
+            date_key,
+            customer_key,
+            product_key,
+            location_key,
+            ship_date,
+            ship_mode,
+            quantity,
+            sales,
+            discount,
+            profit
+        )
         VALUES
-            (
-                %s, %s, %s, %s, %s,
-                %s, %s, %s, %s, %s, %s
-            )
+        (
+            %s, %s, %s, %s, %s,
+            %s, %s, %s, %s, %s, %s
+        )
     """
 
-    cursor = connection.cursor()
+    cursor.executemany(
+        query,
+        records
+    )
 
-    cursor.executemany(query, records)
     connection.commit()
     cursor.close()
 
-    print(f"Sales loaded: {len(records):,}")
+    print(
+        f"Sales rows loaded: {len(records)}"
+    )
 
 
-if __name__ == "__main__":
+# ============================================================
+# MAIN ETL PIPELINE
+# ============================================================
+
+def main():
+
+    print("Starting ETL pipeline...")
+
+    df = load_raw_data()
 
     connection = get_connection()
 
     try:
-        df = load_raw_data()
-        df = transform_data(df)
 
-        load_customers(connection, df)
-        load_products(connection, df)
-        load_locations(connection, df)
-        load_dates(connection, df)
-        load_sales(connection, df)
+        load_customers(
+            connection,
+            df
+        )
+
+        load_products(
+            connection,
+            df
+        )
+
+        load_locations(
+            connection,
+            df
+        )
+
+        load_dates(
+            connection,
+            df
+        )
+
+        load_fact_sales(
+            connection,
+            df
+        )
+
+        print()
+        print("=" * 60)
+        print("ETL PIPELINE COMPLETED SUCCESSFULLY")
+        print("=" * 60)
 
     finally:
+
         connection.close()
+
+        print(
+            "MySQL connection closed."
+        )
+
+
+if __name__ == "__main__":
+    main()

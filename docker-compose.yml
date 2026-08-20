@@ -1,0 +1,62 @@
+version: "3.8"
+
+services:
+
+  mysql:
+    image: mysql:8.0
+    container_name: cloud-analytics-mysql
+    restart: unless-stopped
+
+    environment:
+      MYSQL_DATABASE: cloud_analytics
+      MYSQL_USER: cloud_etl_user
+      MYSQL_PASSWORD: CloudETL@2026!
+      MYSQL_ROOT_PASSWORD: CloudRoot@2026!
+
+    ports:
+      - "3307:3306"
+
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./sql/schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
+
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "mysqladmin",
+          "ping",
+          "-h",
+          "localhost",
+          "-u",
+          "cloud_etl_user",
+          "-pCloudETL@2026!"
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  etl:
+    build:
+      context: .
+
+    container_name: cloud-analytics-etl
+
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+    environment:
+      MYSQL_HOST: mysql
+      MYSQL_PORT: 3306
+      MYSQL_USER: cloud_etl_user
+      MYSQL_PASSWORD: CloudETL@2026!
+      MYSQL_DATABASE: cloud_analytics
+
+    volumes:
+      - ./data:/app/data
+      - ./sql:/app/sql
+
+
+volumes:
+  mysql_data:
